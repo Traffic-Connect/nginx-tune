@@ -177,8 +177,9 @@ backup_file() {
             log_success "Бэкап $file создан: $backup_name."
             # Ротация: оставлять только последние $MAX_BACKUPS
             local backups=( $(ls -1t $file.bak.* 2>/dev/null) )
-            if [ ${#backups[@]} -gt $MAX_BACKUPS ]; then
-                for ((i=$MAX_BACKUPS; i<${#backups[@]}; i++)); do
+            local count=${#backups[@]}
+            if [ -n "$count" ] && [ -n "$MAX_BACKUPS" ] && [ "$count" -gt "$MAX_BACKUPS" ]; then
+                for ((i=$MAX_BACKUPS; i<$count; i++)); do
                     rm -f "${backups[$i]}"
                     log_warn "Удалён старый бэкап: ${backups[$i]}"
                 done
