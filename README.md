@@ -42,8 +42,5 @@ sudo bash nginx_conf.sh --rollback
 - Используйте dry-run для предварительного просмотра изменений.
 - Для отката изменений используйте `--rollback`.
 
-## Лицензия
-[MIT License](LICENSE)
-
 ## Обратная связь
 Вопросы, баги и предложения — через [issues](https://github.com/Traffic-Connect/nginx-tune/issues) на GitHub. 
