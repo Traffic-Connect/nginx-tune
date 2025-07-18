@@ -31,12 +31,17 @@ USE_COLOR=1
 
 # === Парсинг аргументов ===
 DRY_RUN=0
+INTERACTIVE=0
+MAX_BACKUPS=5  # Количество бэкапов для хранения
 for arg in "$@"; do
     if [[ "$arg" == "--dry-run" ]]; then
         DRY_RUN=1
     fi
     if [[ "$arg" == "--no-color" ]]; then
         USE_COLOR=0
+    fi
+    if [[ "$arg" == "--interactive" ]]; then
+        INTERACTIVE=1
     fi
     # ... другие аргументы ...
 done
@@ -108,6 +113,10 @@ for f in "$NGINX_CONF" "$LIMITS_CONF" "$SYSTEMD_OVERRIDE"; do
         log_warn "$f не найден! Будет создан минимальный файл-заглушка."
         if [ "$f" = "$NGINX_CONF" ]; then
             echo -e "user www-data;\nevents { }\nhttp { }" > "$f"
+        elif [ "$f" = "$SYSTEMD_OVERRIDE" ]; then
+            # Создаём директорию для systemd override, если её нет
+            mkdir -p "$(dirname "$f")"
+            touch "$f"
         else
             touch "$f"
         fi
@@ -310,6 +319,70 @@ else
     log_success "Секция events с worker_connections добавлена."
 fi
 
+# === Настройка systemd override для NGINX ===
+print_stage "Настройка systemd override для NGINX"
+HARD_NOFILE_LIMIT=1048576
+if ! mkdir -p "$(dirname $SYSTEMD_OVERRIDE)"; then
+    log_error "Не удалось создать директорию для systemd override!"
+    exit 1
+fi
+if ! cat > $SYSTEMD_OVERRIDE <<EOF
+[Service]
+LimitNOFILE=$HARD_NOFILE_LIMIT
+EOF
+then
+    log_error "Не удалось записать systemd override!"
+    exit 1
+fi
+log_success "Systemd override для NGINX установлен."
+
+# === Настройка limits.conf ===
+print_stage "Настройка limits.conf"
+SOFT_NOFILE_LIMIT=1048576
+print_param "* soft nofile" "$SOFT_NOFILE_LIMIT"
+print_param "* hard nofile" "$HARD_NOFILE_LIMIT"
+if ! grep -q "\* soft nofile $SOFT_NOFILE_LIMIT" $LIMITS_CONF; then
+    if echo "* soft nofile $SOFT_NOFILE_LIMIT" >> $LIMITS_CONF; then
+        log_success "* soft nofile $SOFT_NOFILE_LIMIT добавлен в limits.conf."
+    else
+        log_error "Не удалось добавить * soft nofile $SOFT_NOFILE_LIMIT в limits.conf!"
+        exit 1
+    fi
+else
+    log_warn "* soft nofile $SOFT_NOFILE_LIMIT уже присутствует в limits.conf."
+fi
+if ! grep -q "\* hard nofile $HARD_NOFILE_LIMIT" $LIMITS_CONF; then
+    if echo "* hard nofile $HARD_NOFILE_LIMIT" >> $LIMITS_CONF; then
+        log_success "* hard nofile $HARD_NOFILE_LIMIT добавлен в limits.conf."
+    else
+        log_error "Не удалось добавить * hard nofile $HARD_NOFILE_LIMIT в limits.conf!"
+        exit 1
+    fi
+else
+    log_warn "* hard nofile $HARD_NOFILE_LIMIT уже присутствует в limits.conf."
+fi
+
+# === Применение лимитов для текущей сессии ===
+print_stage "Применение лимитов для текущей сессии"
+ulimit -n $HARD_NOFILE_LIMIT
+log_success "Лимиты применены для текущей сессии."
+
+# === Перезагрузка systemd для применения override ===
+print_stage "Перезагрузка systemd"
+systemctl daemon-reload
+log_success "Systemd перезагружен для применения override."
+
+# === Проверка текущих лимитов ===
+print_stage "Проверка текущих лимитов"
+CURRENT_ULIMIT=$(ulimit -n)
+print_param "Текущий ulimit -n" "$CURRENT_ULIMIT"
+if [ "$CURRENT_ULIMIT" -lt "$HARD_NOFILE_LIMIT" ]; then
+    log_warn "Текущий ulimit меньше ожидаемого! Попытка увеличить..."
+    ulimit -n $HARD_NOFILE_LIMIT
+    CURRENT_ULIMIT=$(ulimit -n)
+    print_param "Новый ulimit -n" "$CURRENT_ULIMIT"
+fi
+
 # === Проверка синтаксиса NGINX ===
 print_stage "Проверка синтаксиса NGINX"
 if nginx -t; then
@@ -370,13 +443,7 @@ print_param "multi_accept" "$MULTI_ACCEPT"
 print_param "reuseport" "$REUSEPORT"
 
 # === Интерактивный режим ===
-INTERACTIVE=0
-for arg in "$@"; do
-    if [[ "$arg" == "--interactive" ]]; then
-        INTERACTIVE=1
-    fi
-    # ...
-done
+# Переменная INTERACTIVE уже инициализирована в начале скрипта
 confirm() {
     if [ "$INTERACTIVE" -eq 1 ]; then
         read -p "Продолжить действие? [y/N]: " ans
@@ -387,6 +454,12 @@ confirm() {
     fi
     return 0
 }
+
+# === Обновление системы (с учётом пакетного менеджера) ===
+print_stage "Обновление системы"
+if ! confirm; then
+    log_warn "Обновление системы пропущено пользователем."
+else
 
 # === Обновление системы (с учётом пакетного менеджера) ===
 print_stage "Обновление системы"
@@ -414,48 +487,6 @@ else
     log_warn "Неизвестный пакетный менеджер: $PKG_MGR. Пропускаю обновление."
 fi
 log_success "Система обновлена."
-
-# === Настройка systemd override для NGINX ===
-print_stage "Настройка systemd override для NGINX"
-HARD_NOFILE_LIMIT=1048576
-if ! mkdir -p "$(dirname $SYSTEMD_OVERRIDE)"; then
-    log_error "Не удалось создать директорию для systemd override!"
-    exit 1
-fi
-if ! cat > $SYSTEMD_OVERRIDE <<EOF
-[Service]
-LimitNOFILE=$HARD_NOFILE_LIMIT
-EOF
-then
-    log_error "Не удалось записать systemd override!"
-    exit 1
-fi
-log_success "Systemd override для NGINX установлен."
-
-# === Настройка limits.conf ===
-print_stage "Настройка limits.conf"
-SOFT_NOFILE_LIMIT=1048576
-print_param "* soft nofile" "$SOFT_NOFILE_LIMIT"
-print_param "* hard nofile" "$HARD_NOFILE_LIMIT"
-if ! grep -q "\* soft nofile $SOFT_NOFILE_LIMIT" $LIMITS_CONF; then
-    if echo "* soft nofile $SOFT_NOFILE_LIMIT" >> $LIMITS_CONF; then
-        log_success "* soft nofile $SOFT_NOFILE_LIMIT добавлен в limits.conf."
-    else
-        log_error "Не удалось добавить * soft nofile $SOFT_NOFILE_LIMIT в limits.conf!"
-        exit 1
-    fi
-else
-    log_warn "* soft nofile $SOFT_NOFILE_LIMIT уже присутствует в limits.conf."
-fi
-if ! grep -q "\* hard nofile $HARD_NOFILE_LIMIT" $LIMITS_CONF; then
-    if echo "* hard nofile $HARD_NOFILE_LIMIT" >> $LIMITS_CONF; then
-        log_success "* hard nofile $HARD_NOFILE_LIMIT добавлен в limits.conf."
-    else
-        log_error "Не удалось добавить * hard nofile $HARD_NOFILE_LIMIT в limits.conf!"
-        exit 1
-    fi
-else
-    log_warn "* hard nofile $HARD_NOFILE_LIMIT уже присутствует в limits.conf."
 fi
 
 # === Проверка PAM limits ===
@@ -615,16 +646,6 @@ if [ "$DRY_RUN" -eq 1 ]; then
     color_echo "$YELLOW" "\n[DRY-RUN] Скрипт завершён: ни один файл или параметр не был изменён."
     exit 0
 fi
-
-# === Проверка статуса nginx до рестарта ===
-print_stage "Статус nginx до рестарта"
-NGINX_PID_BEFORE=$(pidof nginx | awk '{print $1}')
-if [ -n "$NGINX_PID_BEFORE" ]; then
-    log_success "nginx запущен, PID: $NGINX_PID_BEFORE"
-else
-    log_warn "nginx не запущен до рестарта."
-fi
-systemctl status nginx | head -20
 
 # === Генерация HTML-отчёта ===
 HTML_REPORT="/var/log/nginx_tune_report.html"
