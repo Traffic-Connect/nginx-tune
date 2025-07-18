@@ -101,6 +101,22 @@ if [ -n "$MISSING_BINS" ]; then
     exit 1
 fi
 
+# === Установка лимитов для текущей сессии в начале скрипта ===
+print_stage "Установка лимитов для текущей сессии"
+CURRENT_ULIMIT=$(ulimit -n)
+print_param "Начальный ulimit -n" "$CURRENT_ULIMIT"
+if [ "$CURRENT_ULIMIT" -lt 10000 ]; then
+    log_warn "Начальный ulimit ($CURRENT_ULIMIT) слишком мал! Увеличиваю до безопасного значения..."
+    ulimit -n 65536
+    NEW_ULIMIT=$(ulimit -n)
+    print_param "Новый ulimit -n" "$NEW_ULIMIT"
+    if [ "$NEW_ULIMIT" -lt 10000 ]; then
+        log_warn "Не удалось увеличить ulimit. Будем работать с текущим значением."
+    else
+        log_success "ulimit увеличен до $NEW_ULIMIT"
+    fi
+fi
+
 # Определяем переменные путей до любого использования
 NGINX_CONF="/etc/nginx/nginx.conf"
 SYSTEMD_OVERRIDE="/etc/systemd/system/nginx.service.d/override.conf"
@@ -372,19 +388,35 @@ print_stage "Перезагрузка systemd"
 systemctl daemon-reload
 log_success "Systemd перезагружен для применения override."
 
-# === Проверка текущих лимитов ===
-print_stage "Проверка текущих лимитов"
+# === Проверка и установка лимитов для текущей сессии ===
+print_stage "Проверка и установка лимитов для текущей сессии"
 CURRENT_ULIMIT=$(ulimit -n)
 print_param "Текущий ulimit -n" "$CURRENT_ULIMIT"
 if [ "$CURRENT_ULIMIT" -lt "$HARD_NOFILE_LIMIT" ]; then
-    log_warn "Текущий ulimit меньше ожидаемого! Попытка увеличить..."
+    log_warn "Текущий ulimit ($CURRENT_ULIMIT) меньше ожидаемого ($HARD_NOFILE_LIMIT)! Увеличиваю..."
     ulimit -n $HARD_NOFILE_LIMIT
     CURRENT_ULIMIT=$(ulimit -n)
     print_param "Новый ulimit -n" "$CURRENT_ULIMIT"
+    if [ "$CURRENT_ULIMIT" -lt "$HARD_NOFILE_LIMIT" ]; then
+        log_warn "Не удалось увеличить ulimit до $HARD_NOFILE_LIMIT. Текущий: $CURRENT_ULIMIT"
+    else
+        log_success "ulimit успешно увеличен до $CURRENT_ULIMIT"
+    fi
+else
+    log_success "Текущий ulimit ($CURRENT_ULIMIT) уже достаточен"
 fi
 
 # === Проверка синтаксиса NGINX ===
 print_stage "Проверка синтаксиса NGINX"
+print_param "Текущий ulimit для тестирования" "$(ulimit -n)"
+
+# Проверяем, что ulimit достаточен для тестирования
+if [ "$(ulimit -n)" -lt 10000 ]; then
+    log_warn "ulimit слишком мал для тестирования конфигурации! Попытка увеличить..."
+    ulimit -n $HARD_NOFILE_LIMIT
+    print_param "Новый ulimit для тестирования" "$(ulimit -n)"
+fi
+
 if nginx -t; then
     log_success "Синтаксис NGINX в порядке."
 else
@@ -555,6 +587,15 @@ done
 
 # === Применение изменений и автоматический откат ===
 print_stage "Применение изменений"
+
+# Проверяем и устанавливаем лимиты перед перезапуском
+CURRENT_ULIMIT=$(ulimit -n)
+if [ "$CURRENT_ULIMIT" -lt 10000 ]; then
+    log_warn "ulimit перед перезапуском nginx слишком мал ($CURRENT_ULIMIT)! Увеличиваю..."
+    ulimit -n $HARD_NOFILE_LIMIT
+    print_param "Новый ulimit перед перезапуском" "$(ulimit -n)"
+fi
+
 systemctl daemon-reload
 if ! systemctl restart nginx; then
     rollback_and_exit "Не удалось перезапустить nginx!"
@@ -584,10 +625,20 @@ NGINX_PID=$(pidof nginx | awk '{print $1}')
 if [ -n "$NGINX_PID" ]; then
     ACTUAL_LIMIT=$(cat /proc/$NGINX_PID/limits | grep "Max open files" | awk '{print $(NF-1)}')
     print_param "Фактический лимит nginx" "$ACTUAL_LIMIT"
+    print_param "Текущий ulimit сессии" "$(ulimit -n)"
     if [ "$ACTUAL_LIMIT" -lt "$HARD_NOFILE_LIMIT" ]; then
-        log_warn "Фактический лимит меньше ожидаемого! Проверьте настройки."
+        log_warn "Фактический лимит nginx ($ACTUAL_LIMIT) меньше ожидаемого ($HARD_NOFILE_LIMIT)! Проверьте настройки."
     else
-        log_success "Фактический лимит соответствует ожидаемому."
+        log_success "Фактический лимит nginx соответствует ожидаемому ($ACTUAL_LIMIT)."
+    fi
+    
+    # Проверяем количество открытых файлов
+    OPEN_FILES=$(lsof -p $NGINX_PID 2>/dev/null | wc -l)
+    print_param "Открытых файлов у nginx" "$OPEN_FILES"
+    if [ "$OPEN_FILES" -gt 1000 ]; then
+        log_warn "Много открытых файлов у nginx ($OPEN_FILES). Возможно, есть проблемы с конфигурацией."
+    else
+        log_success "Количество открытых файлов у nginx в норме ($OPEN_FILES)."
     fi
 else
     log_warn "Не удалось определить PID NGINX для проверки лимита."
